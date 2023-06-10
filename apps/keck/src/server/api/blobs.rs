@@ -90,10 +90,77 @@ pub async fn get_blob(
 /// - Return 200 if `Blob` save successful.
 /// - Return 404 Not Found if `Workspace` not exists.
 #[utoipa::path(
-    post,
+    put,
     tag = "Blobs",
     context_path = "/api/blobs",
     path = "/{workspace_id}",
+    params(
+        ("workspace_id", description = "workspace id"),
+    ),
+    request_body(
+        content = BodyStream,
+        content_type="application/octet-stream"
+    ),
+    responses(
+        (status = 200, description = "Blob was saved", body = BlobStatus),
+        (status = 404, description = "Workspace not found", body = BlobStatus),
+    )
+)]
+pub async fn set_blob(
+    Extension(context): Extension<Arc<Context>>,
+    Path(workspace): Path<String>,
+    body: BodyStream,
+) -> Response {
+    info!("set_blob: {}", workspace);
+
+    let mut has_error = false;
+    let body = body
+        .take_while(|x| {
+            has_error = x.is_err();
+            future::ready(x.is_ok())
+        })
+        .filter_map(|data| future::ready(data.ok()));
+
+    if let Ok(id) = context
+        .storage
+        .blobs()
+        .put_blob(Some(workspace.clone()), body)
+        .await
+    {
+        if has_error {
+            let _ = context
+                .storage
+                .blobs()
+                .delete_blob(Some(workspace), id)
+                .await;
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        } else {
+            Json(BlobStatus {
+                id: Some(id),
+                exists: true,
+            })
+            .into_response()
+        }
+    } else {
+        (
+            StatusCode::NOT_FOUND,
+            Json(BlobStatus {
+                id: None,
+                exists: false,
+            }),
+        )
+            .into_response()
+    }
+}
+
+/// Save `Blob` if not exists
+/// - Return 200 if `Blob` save successful.
+/// - Return 404 Not Found if `Workspace` not exists.
+#[utoipa::path(
+    put,
+    tag = "Blobs",
+    context_path = "/api/blobs",
+    path = "/{workspace_id}/{hash}",
     params(
         ("workspace_id", description = "workspace id"),
         ("hash", description = "blob hash"),
@@ -107,13 +174,13 @@ pub async fn get_blob(
         (status = 404, description = "Workspace not found", body = BlobStatus),
     )
 )]
-pub async fn set_blob(
+pub async fn put_blob(
     Extension(context): Extension<Arc<Context>>,
     Path(params): Path<(String, String)>,
     body: BodyStream,
 ) -> Response {
     let (workspace, hash) = params;
-    info!("set_blob: {}, {}", workspace, hash);
+    info!("put_blob: {}, {}", workspace, hash);
 
     let mut has_error = false;
     let body = body
@@ -199,7 +266,10 @@ pub async fn delete_blob(
 pub fn blobs_apis(router: Router) -> Router {
     router.route("/blobs/:workspace", post(set_blob)).route(
         "/blobs/:workspace/:blob",
-        head(check_blob).get(get_blob).delete(delete_blob),
+        head(check_blob)
+            .get(get_blob)
+            .put(put_blob)
+            .delete(delete_blob),
     )
 }
 

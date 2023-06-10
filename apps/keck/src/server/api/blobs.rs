@@ -109,10 +109,11 @@ pub async fn get_blob(
 )]
 pub async fn set_blob(
     Extension(context): Extension<Arc<Context>>,
-    Path(workspace): Path<String>,
+    Path(params): Path<(String, String)>,
     body: BodyStream,
 ) -> Response {
-    info!("set_blob: {}", workspace);
+    let (workspace, hash) = params;
+    info!("set_blob: {}, {}", workspace, hash);
 
     let mut has_error = false;
     let body = body
@@ -125,7 +126,7 @@ pub async fn set_blob(
     if let Ok(id) = context
         .storage
         .blobs()
-        .put_blob(Some(workspace.clone()), body)
+        .named_put_blob(Some(workspace.clone()), Some(hash), body)
         .await
     {
         if has_error {

@@ -178,6 +178,26 @@ impl BlobStorage<JwstStorageError> for BlobDBStorage {
         }
     }
 
+    async fn named_put_blob(
+        &self,
+        workspace: Option<String>,
+        hash: Option<String>,
+        stream: impl Stream<Item = Bytes> + Send,
+    ) -> JwstStorageResult<String> {
+        let _lock = self.bucket.write().await;
+        let workspace = workspace.unwrap_or("__default__".into());
+
+        let (_hash, blob) = get_hash(stream).await;
+
+        let hash = hash.unwrap_or(_hash);
+
+        if self.insert(&workspace, &hash, &blob).await.is_ok() {
+            Ok(hash)
+        } else {
+            Err(JwstStorageError::WorkspaceNotFound(workspace))
+        }
+    }
+
     async fn delete_blob(
         &self,
         workspace_id: Option<String>,

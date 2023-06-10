@@ -245,6 +245,15 @@ impl BlobStorage<JwstStorageError> for BlobAutoStorage {
         self.db.put_blob(workspace, stream).await
     }
 
+    async fn named_put_blob(
+        &self,
+        workspace: Option<String>,
+        hash: Option<String>,
+        stream: impl Stream<Item = Bytes> + Send,
+    ) -> JwstStorageResult<String> {
+        self.db.named_put_blob(workspace, hash, stream).await
+    }
+
     async fn delete_blob(
         &self,
         workspace_id: Option<String>,

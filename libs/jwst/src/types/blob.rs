@@ -34,4 +34,12 @@ pub trait BlobStorage<E = JwstError> {
     async fn delete_blob(&self, workspace: Option<String>, id: String) -> JwstResult<bool, E>;
     async fn delete_workspace(&self, workspace_id: String) -> JwstResult<(), E>;
     async fn get_blobs_size(&self, workspace_id: String) -> JwstResult<i64, E>;
+    async fn named_put_blob(
+        &self,
+        _workspace: Option<String>,
+        hash: Option<String>,
+        _stream: impl Stream<Item = Bytes> + Send,
+    ) -> JwstResult<String, E> {
+        Ok(hash.unwrap())
+    }
 }

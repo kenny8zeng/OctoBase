@@ -1,4 +1,5 @@
 use super::*;
+use crate::sync::{Arc, RwLock};
 use serde_json::Value as JsonValue;
 use std::ops::Deref;
 
@@ -18,11 +19,32 @@ pub enum Content {
     },
     #[cfg_attr(test, proptest(skip))]
     Type(YTypeRef),
+    #[cfg_attr(test, proptest(skip))]
+    WeakType(YTypeWeakRef),
     Any(Vec<Any>),
     Doc {
         guid: String,
         opts: Vec<Any>,
     },
+}
+
+impl From<Any> for Content {
+    fn from(value: Any) -> Self {
+        match value {
+            Any::Undefined
+            | Any::Null
+            | Any::Integer(_)
+            | Any::Float32(_)
+            | Any::Float64(_)
+            | Any::BigInt64(_)
+            | Any::False
+            | Any::True
+            | Any::String(_)
+            | Any::Object(_) => Content::Any(vec![value]),
+            Any::Array(v) => Content::Any(v),
+            Any::Binary(b) => Content::Binary(b),
+        }
+    }
 }
 
 impl PartialEq for Content {
@@ -47,6 +69,16 @@ impl PartialEq for Content {
             (Self::Doc { guid: guid1, .. }, Self::Doc { guid: guid2, .. }) => guid1 == guid2,
             (Self::Type(ty1), Self::Type(ty2)) => {
                 ty1.read().unwrap().deref() == ty2.read().unwrap().deref()
+            }
+            (Self::WeakType(ty1), Self::WeakType(ty2)) => {
+                ty1.upgrade().unwrap().read().unwrap().deref()
+                    == ty2.upgrade().unwrap().read().unwrap().deref()
+            }
+            (Self::WeakType(ty1), Self::Type(ty2)) => {
+                ty1.upgrade().unwrap().read().unwrap().deref() == ty2.read().unwrap().deref()
+            }
+            (Self::Type(ty1), Self::WeakType(ty2)) => {
+                ty1.read().unwrap().deref() == ty2.upgrade().unwrap().read().unwrap().deref()
             }
             _ => false,
         }
@@ -73,6 +105,7 @@ impl std::fmt::Debug for Content {
                 .field("value", value)
                 .finish(),
             Self::Type(arg0) => f.debug_tuple("Type").field(arg0).finish(),
+            Self::WeakType(arg0) => f.debug_tuple("WeakType").field(arg0).finish(),
             Self::Any(arg0) => f.debug_tuple("Any").field(arg0).finish(),
             Self::Doc { guid, opts } => f
                 .debug_struct("Doc")
@@ -130,7 +163,7 @@ impl Content {
                 };
 
                 let ty = YType::new(kind, tag_name);
-                Ok(Self::Type(ty.into_ref()))
+                Ok(Self::Type(Arc::new(RwLock::new(ty))))
             } // YType
             8 => Ok(Self::Any(Any::read_multiple(decoder)?)), // Any
             9 => {
@@ -153,6 +186,7 @@ impl Content {
             Self::Embed(_) => 5,
             Self::Format { .. } => 6,
             Self::Type(_) => 7,
+            Self::WeakType(_) => 7,
             Self::Any(_) => 8,
             Self::Doc { .. } => 9,
         }
@@ -197,6 +231,19 @@ impl Content {
                     _ => {}
                 }
             }
+            Self::WeakType(ty) => {
+                let ty = ty.upgrade().unwrap();
+                let ty = ty.read().unwrap();
+                let type_ref = u64::from(ty.kind());
+                encoder.write_var_u64(type_ref)?;
+
+                match ty.kind {
+                    YTypeKind::XMLElement | YTypeKind::XMLHook => {
+                        encoder.write_var_string(ty.name.as_ref().unwrap())?;
+                    }
+                    _ => {}
+                }
+            }
             Self::Any(any) => {
                 Any::write_multiple(encoder, any)?;
             }
@@ -218,6 +265,7 @@ impl Content {
             | Self::Embed(_)
             | Self::Format { .. }
             | Self::Type(_)
+            | Self::WeakType(_)
             | Self::Doc { .. } => 1,
         }
     }
@@ -257,6 +305,7 @@ impl Content {
             | Self::Embed(_)
             | Self::Format { .. }
             | Self::Type(_)
+            | Self::WeakType(_)
             | Self::Doc { .. } => {
                 if index == 0 {
                     Some(self.clone())
@@ -310,7 +359,48 @@ impl Content {
 
         s.split_at(utf_8_offset)
     }
+
+    pub fn as_array(&self) -> Option<Array> {
+        if let Self::Type(type_ref) = self {
+            return Array::try_from(type_ref.clone()).ok();
+        }
+        None
+    }
 }
+
+macro_rules! impl_primitive_from {
+    (any => $($ty:ty),* $(,)?) => {
+        $(
+            impl From<$ty> for Content {
+                fn from(value: $ty) -> Self {
+                    Self::Any(vec![value.into()])
+                }
+            }
+        )*
+    };
+    (raw => $($ty:ty: $v:ident),* $(,)?) => {
+        $(
+            impl From<$ty> for Content {
+                fn from(value: $ty) -> Self {
+                    Self::$v(value)
+                }
+            }
+        )*
+    };
+    (type_ref => $($ty:ty),* $(,)?) => {
+        $(
+            impl From<$ty> for Content {
+                fn from(type_ref: $ty) -> Self {
+                    Self::WeakType($crate::sync::Arc::downgrade(&type_ref.as_inner()))
+                }
+            }
+        )*
+    }
+}
+
+impl_primitive_from! { any => u8, u16, u32, u64, usize, i8, i16, i32, i64, isize, String, &str, f32, f64, bool }
+impl_primitive_from! { raw => Vec<u8>: Binary, YTypeWeakRef: WeakType }
+impl_primitive_from! { type_ref => Array, Text }
 
 #[cfg(test)]
 mod tests {
@@ -332,37 +422,48 @@ mod tests {
 
     #[test]
     fn test_content() {
-        let contents = [
-            Content::Deleted(42),
-            Content::JSON(vec![
-                None,
-                Some("test_1".to_string()),
-                Some("test_2".to_string()),
-            ]),
-            Content::Binary(vec![1, 2, 3]),
-            Content::String("hello".to_string()),
-            Content::Embed(JsonValue::Bool(true)),
-            Content::Format {
-                key: "key".to_string(),
-                value: JsonValue::Number(42.into()),
-            },
-            Content::Type(YType::new(YTypeKind::Array, None).into_ref()),
-            Content::Type(YType::new(YTypeKind::Map, None).into_ref()),
-            Content::Type(YType::new(YTypeKind::Text, None).into_ref()),
-            Content::Type(YType::new(YTypeKind::XMLElement, Some("test".to_string())).into_ref()),
-            Content::Type(YType::new(YTypeKind::XMLFragment, None).into_ref()),
-            Content::Type(YType::new(YTypeKind::XMLHook, Some("test".to_string())).into_ref()),
-            Content::Type(YType::new(YTypeKind::XMLText, None).into_ref()),
-            Content::Any(vec![Any::BigInt64(42), Any::String("Test Any".to_string())]),
-            Content::Doc {
-                guid: "my_guid".to_string(),
-                opts: vec![Any::BigInt64(42), Any::String("Test Doc".to_string())],
-            },
-        ];
+        loom_model!({
+            let contents = [
+                Content::Deleted(42),
+                Content::JSON(vec![
+                    None,
+                    Some("test_1".to_string()),
+                    Some("test_2".to_string()),
+                ]),
+                Content::Binary(vec![1, 2, 3]),
+                Content::String("hello".to_string()),
+                Content::Embed(JsonValue::Bool(true)),
+                Content::Format {
+                    key: "key".to_string(),
+                    value: JsonValue::Number(42.into()),
+                },
+                Content::Type(Arc::new(RwLock::new(YType::new(YTypeKind::Array, None)))),
+                Content::Type(Arc::new(RwLock::new(YType::new(YTypeKind::Map, None)))),
+                Content::Type(Arc::new(RwLock::new(YType::new(YTypeKind::Text, None)))),
+                Content::Type(Arc::new(RwLock::new(YType::new(
+                    YTypeKind::XMLElement,
+                    Some("test".to_string()),
+                )))),
+                Content::Type(Arc::new(RwLock::new(YType::new(
+                    YTypeKind::XMLFragment,
+                    None,
+                )))),
+                Content::Type(Arc::new(RwLock::new(YType::new(
+                    YTypeKind::XMLHook,
+                    Some("test".to_string()),
+                )))),
+                Content::Type(Arc::new(RwLock::new(YType::new(YTypeKind::XMLText, None)))),
+                Content::Any(vec![Any::BigInt64(42), Any::String("Test Any".to_string())]),
+                Content::Doc {
+                    guid: "my_guid".to_string(),
+                    opts: vec![Any::BigInt64(42), Any::String("Test Doc".to_string())],
+                },
+            ];
 
-        for content in &contents {
-            content_round_trip(content).unwrap();
-        }
+            for content in &contents {
+                content_round_trip(content).unwrap();
+            }
+        });
     }
 
     #[test]
@@ -413,6 +514,7 @@ mod tests {
 
     proptest! {
         #[test]
+        #[cfg_attr(miri, ignore)]
         fn test_random_content(contents in vec(any::<Content>(), 0..10)) {
             for content in &contents {
                 content_round_trip(content).unwrap();

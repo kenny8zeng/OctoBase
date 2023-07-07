@@ -2,21 +2,21 @@
 mod codec;
 mod doc;
 mod protocol;
+mod sync;
 
 pub use codec::{
     read_var_buffer, read_var_i64, read_var_string, read_var_u64, write_var_buffer, write_var_i64,
     write_var_string, write_var_u64,
 };
 pub use doc::{
-    Any, Awareness, AwarenessEvent, Client, Clock, Content, CrdtRead, CrdtReader, CrdtWrite,
-    CrdtWriter, Doc, Id, Item, RawDecoder, RawEncoder, Update,
+    Any, Array, Awareness, AwarenessEvent, Client, Clock, Content, CrdtRead, CrdtReader, CrdtWrite,
+    CrdtWriter, Doc, DocOptions, Id, Item, Map, RawDecoder, RawEncoder, Text, Update,
 };
 pub use protocol::{
     read_sync_message, write_sync_message, AwarenessState, AwarenessStates, DocMessage,
     SyncMessage, SyncMessageScanner,
 };
 
-use doc::StructInfo;
 use jwst_logger::warn;
 use nanoid::nanoid;
 use nom::IResult;
@@ -48,8 +48,8 @@ pub enum JwstCodecError {
     InvalidParent,
     #[error("Parent not found")]
     ParentNotFound,
-    #[error("Invalid struct type, expect item, actually {0:?}")]
-    InvalidStructType(StructInfo),
+    #[error("Invalid struct type, expect item, actually {0}")]
+    InvalidStructType(&'static str),
     #[error("Can not cast known type to {0}")]
     TypeCastError(&'static str),
     #[error("Index {0} out of bound")]

@@ -1,15 +1,11 @@
-use std::sync::{
-    atomic::{AtomicU8, Ordering},
-    Arc,
-};
-
 use super::*;
+use crate::sync::{Arc, AtomicU8, Ordering};
 
 #[derive(Debug, Clone)]
 #[cfg_attr(test, derive(proptest_derive::Arbitrary))]
 pub enum Parent {
     #[cfg_attr(test, proptest(skip))]
-    Type(YTypeRef),
+    Type(YTypeWeakRef),
     String(String),
     Id(Id),
 }
@@ -116,14 +112,14 @@ impl ItemFlags {
 }
 
 #[derive(Clone)]
-#[cfg_attr(test, derive(proptest_derive::Arbitrary))]
+#[cfg_attr(all(test, not(loom)), derive(proptest_derive::Arbitrary))]
 pub struct Item {
     pub id: Id,
     pub origin_left_id: Option<Id>,
     pub origin_right_id: Option<Id>,
-    #[cfg_attr(test, proptest(value = "None"))]
+    #[cfg_attr(all(test, not(loom)), proptest(value = "None"))]
     pub left: Option<StructInfo>,
-    #[cfg_attr(test, proptest(value = "None"))]
+    #[cfg_attr(all(test, not(loom)), proptest(value = "None"))]
     pub right: Option<StructInfo>,
     pub parent: Option<Parent>,
     pub parent_sub: Option<String>,
@@ -131,7 +127,7 @@ pub struct Item {
     // and item can be readonly and cloned fast.
     // TODO: considering using Cow
     pub content: Arc<Content>,
-    #[cfg_attr(test, proptest(value = "ItemFlags::default()"))]
+    #[cfg_attr(all(test, not(loom)), proptest(value = "ItemFlags::default()"))]
     pub flags: ItemFlags,
 }
 
@@ -164,6 +160,12 @@ impl std::fmt::Debug for Item {
     }
 }
 
+impl std::fmt::Display for Item {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Item{}: [{:?}]", self.id, self.content)
+    }
+}
+
 // make all Item readonly
 pub type ItemRef = Arc<Item>;
 
@@ -184,6 +186,32 @@ impl Default for Item {
 }
 
 impl Item {
+    pub fn new(
+        id: Id,
+        content: Content,
+        left: Option<ItemRef>,
+        right: Option<ItemRef>,
+        parent: Option<Parent>,
+        parent_sub: Option<String>,
+    ) -> Self {
+        let flags = ItemFlags::from(if content.countable() {
+            item_flags::ITEM_COUNTABLE
+        } else {
+            0
+        });
+
+        Self {
+            id,
+            origin_left_id: left.as_ref().map(|l| l.last_id()),
+            left: left.map(|l| StructInfo::WeakItem(Arc::downgrade(&l))),
+            origin_right_id: right.as_ref().map(|r| r.id),
+            right: right.map(|r| StructInfo::WeakItem(Arc::downgrade(&r))),
+            parent,
+            parent_sub,
+            content: Arc::new(content),
+            flags,
+        }
+    }
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
@@ -229,64 +257,69 @@ impl Item {
         &mut *(Arc::as_ptr(item) as *mut Item)
     }
 
-    /// Safety:
-    /// see [inner_mut]
-    pub(crate) unsafe fn swap(one: &Arc<Item>, other: &Arc<Item>) {
-        let one = Self::inner_mut(one);
-        let other = Self::inner_mut(other);
-
-        std::mem::swap(one, other);
-    }
-
     #[allow(dead_code)]
     #[cfg(any(debug, test))]
     pub(crate) fn print_left(&self) {
-        let mut ret = String::new();
-        ret.push_str(&format!("Self{}", self.id));
-
+        let mut ret = vec![format!("Self{}: [{:?}]", self.id, self.content)];
         let mut left = self.left.clone();
 
         while let Some(n) = left {
-            ret.insert_str(
-                0,
-                &format!(
-                    "{}{} <- ",
-                    match n {
-                        StructInfo::Item(_) => "Item",
-                        StructInfo::GC { .. } => "GC",
-                        StructInfo::Skip { .. } => "Skip",
-                    },
-                    n.id()
-                ),
-            );
             left = n.left();
+            if n.deleted() {
+                continue;
+            }
+            match &n {
+                StructInfo::Item(item) => {
+                    ret.push(format!("{item}"));
+                }
+                StructInfo::WeakItem(item) => {
+                    ret.push(format!("{:?}", item.upgrade()));
+                }
+                StructInfo::GC { id, len } => {
+                    ret.push(format!("GC{id}: {len}"));
+                    break;
+                }
+                StructInfo::Skip { id, len } => {
+                    ret.push(format!("Skip{id}: {len}"));
+                    break;
+                }
+            }
         }
+        ret.reverse();
 
-        println!("{ret}");
+        println!("{}", ret.join(" <- "));
     }
 
     #[allow(dead_code)]
     #[cfg(any(debug, test))]
     pub(crate) fn print_right(&self) {
-        let mut ret = String::new();
-        ret.push_str(&format!("Self{}", self.id));
-
+        let mut ret = vec![format!("Self{}: [{:?}]", self.id, self.content)];
         let mut right = self.right.clone();
 
         while let Some(n) = right {
-            ret.push_str(&format!(
-                " -> {}{}",
-                match n {
-                    StructInfo::Item(_) => "Item",
-                    StructInfo::GC { .. } => "GC",
-                    StructInfo::Skip { .. } => "Skip",
-                },
-                n.id()
-            ));
             right = n.right();
+            if n.deleted() {
+                continue;
+            }
+            match &n {
+                StructInfo::Item(item) => {
+                    ret.push(format!("{item}"));
+                }
+                StructInfo::WeakItem(item) => {
+                    ret.push(format!("{:?}", item.upgrade()));
+                }
+                StructInfo::GC { id, len } => {
+                    ret.push(format!("GC{id}: {len}"));
+                    break;
+                }
+                StructInfo::Skip { id, len } => {
+                    ret.push(format!("Skip{id}: {len}"));
+                    break;
+                }
+            }
         }
 
-        println!("{ret}");
+        println!("{}", ret.join(" -> "));
     }
 }
 
@@ -340,7 +373,9 @@ impl Item {
                 debug_assert_ne!(first_5_bit, 10);
                 Arc::new(Content::read(decoder, first_5_bit)?)
             },
-            ..Default::default()
+            left: None,
+            right: None,
+            flags: ItemFlags::from(0),
         };
 
         if item.content.countable() {
@@ -395,6 +430,7 @@ impl Item {
                         encoder.write_item_id(id)?;
                     }
                     Parent::Type(ty) => {
+                        let ty = ty.upgrade().unwrap();
                         let ty = ty.read().unwrap();
                         if let Some(item) = &ty.item {
                             encoder.write_var_u64(0)?;
@@ -450,8 +486,10 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(not(loom))]
     proptest! {
         #[test]
+        #[cfg_attr(miri, ignore)]
         fn test_random_content(mut items in vec(any::<Item>(), 0..10)) {
             for item in &mut items {
                 item_round_trip(item).unwrap();

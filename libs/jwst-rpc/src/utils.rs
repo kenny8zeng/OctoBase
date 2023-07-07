@@ -1,6 +1,6 @@
 use super::*;
 use jwst::{DocStorage, Workspace};
-use jwst_storage::JwstStorage;
+use jwst_storage::{BlobStorageType, JwstStorage};
 use nanoid::nanoid;
 use std::{collections::HashMap, thread::JoinHandle as StdJoinHandler, time::Duration};
 use tokio::{
@@ -20,10 +20,11 @@ impl MinimumServerContext {
     pub async fn new() -> Arc<Self> {
         let storage = 'connect: loop {
             let mut retry = 3;
-            match JwstStorage::new(
+            match JwstStorage::new_with_migration(
                 &std::env::var("DATABASE_URL")
                     .map(|url| format!("{url}_binary"))
                     .unwrap_or("sqlite::memory:".into()),
+                BlobStorageType::DB,
             )
             .await
             {
@@ -54,7 +55,7 @@ impl MinimumServerContext {
         server
             .get_storage()
             .docs()
-            .delete(workspace_id.into())
+            .delete_workspace(workspace_id)
             .await
             .unwrap();
         let ws = server.get_workspace(workspace_id).await.unwrap();

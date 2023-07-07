@@ -233,7 +233,7 @@ impl BlobService {
             return Err(ErrorStatus::NotFound);
         };
 
-        if meta.size != file.len() as u64 {
+        if meta.size != file.len() as i64 {
             header.insert(
                 CONTENT_LENGTH,
                 HeaderValue::from_str(&file.len().to_string()).unwrap(),
@@ -274,7 +274,7 @@ impl BlobService {
         let id = match ctx
             .storage
             .blobs()
-            .put_blob(workspace.clone(), stream)
+            .put_blob_stream(workspace.clone(), stream)
             .await
         {
             Ok(id) => id,

@@ -1,18 +1,16 @@
 mod array;
 mod list;
+mod map;
 mod text;
-mod traits;
 
 use super::*;
+use crate::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard, Weak};
 use list::*;
-use std::{
-    collections::{hash_map::Entry, HashMap},
-    sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard, Weak},
-};
+use std::collections::{hash_map::Entry, HashMap};
 
 pub use array::*;
+pub use map::*;
 pub use text::*;
-pub use traits::*;
 
 use crate::{Item, JwstCodecError, JwstCodecResult};
 
@@ -37,6 +35,7 @@ pub struct YType {
 }
 
 pub type YTypeRef = Arc<RwLock<YType>>;
+pub type YTypeWeakRef = Weak<RwLock<YType>>;
 
 impl PartialEq for YType {
     fn eq(&self, other: &Self) -> bool {
@@ -55,8 +54,21 @@ impl YType {
         }
     }
 
-    pub fn into_ref(self) -> YTypeRef {
-        Arc::new(RwLock::new(self))
+    pub fn into_ref(self) -> YTypeWeakRef {
+        self.root_name
+            .and_then(|name| {
+                self.store.upgrade().and_then(|store| {
+                    store
+                        .read()
+                        .unwrap()
+                        .types
+                        .read()
+                        .unwrap()
+                        .get(&name)
+                        .map(Arc::downgrade)
+                })
+            })
+            .unwrap()
     }
 
     pub fn kind(&self) -> YTypeKind {
@@ -75,6 +87,10 @@ impl YType {
         }
 
         Ok(())
+    }
+
+    pub fn set_item(&mut self, item: ItemRef) {
+        self.item = Some(Arc::downgrade(&item));
     }
 
     pub fn store<'a>(&self) -> Option<RwLockReadGuard<'a, DocStore>> {
@@ -248,13 +264,13 @@ macro_rules! impl_type {
 
             #[allow(dead_code)]
             #[inline(always)]
-            pub(crate) fn read(&self) -> std::sync::RwLockReadGuard<super::YType> {
+            pub(crate) fn read(&self) -> $crate::sync::RwLockReadGuard<super::YType> {
                 self.0.read().unwrap()
             }
 
             #[allow(dead_code)]
             #[inline(always)]
-            pub(crate) fn write(&self) -> std::sync::RwLockWriteGuard<super::YType> {
+            pub(crate) fn write(&self) -> $crate::sync::RwLockWriteGuard<super::YType> {
                 self.0.write().unwrap()
             }
         }
@@ -279,7 +295,9 @@ macro_rules! impl_type {
                         inner.set_kind(super::YTypeKind::$name)?;
                         Ok($name::new(value.clone()))
                     }
-                    _ => Err($crate::JwstCodecError::TypeCastError("Text")),
+                    _ => Err($crate::JwstCodecError::TypeCastError(std::stringify!(
+                        $name
+                    ))),
                 }
             }
         }
@@ -298,7 +316,6 @@ impl_variants!({
 });
 
 // TODO: move to separated impl files.
-impl_type!(Map);
 impl_type!(XMLElement);
 impl_type!(XMLFragment);
 impl_type!(XMLText);

@@ -1,19 +1,58 @@
 mod iterator;
 mod search_marker;
 
-use std::sync::RwLockWriteGuard;
-
 pub use iterator::ListIterator;
-
-use super::*;
 pub use search_marker::MarkerList;
 
+use super::*;
+use crate::sync::RwLockWriteGuard;
+
 pub(crate) struct ItemPosition {
-    pub parent: YTypeRef,
-    pub left: Option<ItemRef>,
-    pub right: Option<ItemRef>,
+    pub parent: YTypeWeakRef,
+    pub left: Option<Weak<Item>>,
+    pub right: Option<Weak<Item>>,
     pub index: u64,
     pub offset: u64,
+}
+
+impl ItemPosition {
+    pub fn forward(&mut self) {
+        if let Some(right) = self.right.take().and_then(|a| a.upgrade()) {
+            if !right.deleted() {
+                self.index += right.len();
+            }
+
+            self.left = Some(Arc::downgrade(&right));
+            self.right = right.right.as_ref().and_then(|right| right.as_weak_item());
+        } else {
+            // FAIL
+        }
+    }
+
+    /// we found a position cursor point in between a splitable item,
+    /// we need to split the item by the offset.
+    ///
+    /// before:
+    /// ---------------------------------
+    ///    ^left                ^right
+    ///            ^offset
+    /// after:
+    /// ---------------------------------
+    ///    ^left   ^right
+    ///
+    pub fn normalize(&mut self, store: &mut DocStore) -> JwstCodecResult {
+        if self.offset > 0 {
+            debug_assert!(self.left.is_some());
+            if let Some(left) = self.left.as_ref().and_then(|a| a.upgrade()) {
+                store.split_node(left.id, self.offset)?;
+                self.right = left.right.as_ref().and_then(|right| right.as_weak_item());
+                self.index += self.offset;
+                self.offset = 0;
+            }
+        }
+
+        Ok(())
+    }
 }
 
 pub(crate) trait ListType: AsInner<Inner = YTypeRef> {
@@ -31,10 +70,10 @@ pub(crate) trait ListType: AsInner<Inner = YTypeRef> {
 
     fn find_pos(&self, inner: &YType, index: u64) -> Option<ItemPosition> {
         let mut remaining = index;
-        let start = inner.start();
+        let start = inner.start().as_ref().map(Arc::downgrade);
 
         let mut pos = ItemPosition {
-            parent: self.as_inner().clone(),
+            parent: Arc::downgrade(self.as_inner()),
             left: None,
             right: start,
             index: 0,
@@ -53,18 +92,20 @@ pub(crate) trait ListType: AsInner<Inner = YTypeRef> {
                     remaining -= marker.index;
                 }
                 pos.index = marker.index;
-                pos.left = marker.ptr.left.as_ref().and_then(|left| left.as_item());
+                pos.left = marker
+                    .ptr
+                    .upgrade()
+                    .and_then(|i| i.left.as_ref().and_then(|i| i.as_weak_item()));
                 pos.right = Some(marker.ptr);
             }
         };
 
         while remaining > 0 {
-            if let Some(item) = pos.right.take() {
+            if let Some(item) = &pos.right.and_then(|i| i.upgrade()) {
                 if !item.deleted() {
                     let content_len = item.len();
                     if remaining < content_len {
                         pos.offset = remaining;
-                        pos.index += remaining;
                         remaining = 0;
                     } else {
                         pos.index += content_len;
@@ -72,13 +113,8 @@ pub(crate) trait ListType: AsInner<Inner = YTypeRef> {
                     }
                 }
 
-                if let Some(StructInfo::Item(right)) = &item.right {
-                    pos.right = Some(right.clone());
-                } else if remaining > 0 {
-                    return None;
-                }
-
-                pos.left = Some(item);
+                pos.left = Some(Arc::downgrade(item));
+                pos.right = item.right.as_ref().and_then(|right| right.as_weak_item());
             } else {
                 return None;
             }
@@ -87,7 +123,7 @@ pub(crate) trait ListType: AsInner<Inner = YTypeRef> {
         Some(pos)
     }
 
-    fn insert_at(&mut self, index: u64, contents: Vec<Content>) -> JwstCodecResult {
+    fn insert_at(&mut self, index: u64, content: Content) -> JwstCodecResult {
         if index > self.content_len() {
             return Err(JwstCodecError::IndexOutOfBound(index));
         }
@@ -95,7 +131,7 @@ pub(crate) trait ListType: AsInner<Inner = YTypeRef> {
         let inner = self.as_inner().write().unwrap();
         if let Some(pos) = self.find_pos(&inner, index) {
             if let Some(mut store) = inner.store_mut() {
-                Self::insert_after(inner, &mut store, pos, contents)?;
+                Self::insert_after(inner, &mut store, pos, content)?;
             }
         }
 
@@ -106,40 +142,39 @@ pub(crate) trait ListType: AsInner<Inner = YTypeRef> {
         mut lock: RwLockWriteGuard<YType>,
         store: &mut DocStore,
         mut pos: ItemPosition,
-        contents: Vec<Content>,
+        content: Content,
     ) -> JwstCodecResult {
-        // insert in between an splitable item.
-        if pos.offset > 0 {
-            debug_assert!(pos.left.is_some());
-            let (_, right) = store.split_node(pos.left.as_ref().unwrap().id, pos.offset)?;
-            pos.right = right.as_item();
-        }
+        pos.normalize(store)?;
 
-        let mut len = 0;
-
-        for content in contents {
-            let new_item_id = (store.client(), store.get_state(store.client())).into();
-            let item = Arc::new(
-                ItemBuilder::new()
-                    .id(new_item_id)
-                    .left(pos.left.as_ref().map(|item| StructInfo::Item(item.clone())))
-                    .right(
-                        pos.right
-                            .as_ref()
-                            .map(|item| StructInfo::Item(item.clone())),
-                    )
-                    .content(content)
-                    .parent(Some(Parent::Type(pos.parent.clone())))
-                    .build(),
-            );
-            store.integrate(StructInfo::Item(item.clone()), 0, Some(&mut lock))?;
-            len += item.len();
-            pos.left = Some(item);
-        }
+        let new_item_id = (store.client(), store.get_state(store.client())).into();
 
         if let Some(markers) = &lock.markers {
-            markers.update_marker_changes(pos.index, len as i64);
+            markers.update_marker_changes(pos.index, content.clock_len() as i64);
         }
+
+        let item = Arc::new(Item::new(
+            new_item_id,
+            content,
+            pos.left.as_ref().and_then(|item| item.upgrade()),
+            pos.right.as_ref().and_then(|item| item.upgrade()),
+            Some(Parent::Type(pos.parent.clone())),
+            None,
+        ));
+
+        match item.content.as_ref() {
+            Content::Type(t) => {
+                t.write().unwrap().set_item(item.clone());
+            }
+            Content::WeakType(t) => {
+                t.upgrade().unwrap().write().unwrap().set_item(item.clone());
+            }
+            _ => {}
+        }
+
+        store.integrate(StructInfo::Item(item.clone()), 0, Some(&mut lock))?;
+
+        pos.right = Some(Arc::downgrade(&item));
+        pos.forward();
 
         Ok(())
     }
@@ -153,9 +188,9 @@ pub(crate) trait ListType: AsInner<Inner = YTypeRef> {
 
         if let Some(pos) = self.find_pos(&inner, index) {
             if pos.offset == 0 {
-                return pos.right.map(|r| (r, 0));
+                return pos.right.and_then(|r| r.upgrade()).map(|r| (r, 0));
             } else {
-                return pos.left.map(|l| (l, pos.offset));
+                return pos.left.and_then(|r| r.upgrade()).map(|l| (l, pos.offset));
             }
         }
 
@@ -187,28 +222,23 @@ pub(crate) trait ListType: AsInner<Inner = YTypeRef> {
         mut pos: ItemPosition,
         len: u64,
     ) -> JwstCodecResult {
+        pos.normalize(store)?;
         let mut remaining = len as i64;
 
-        // delete in between an splitable item.
-        if pos.offset > 0 {
-            debug_assert!(pos.left.is_some());
-            let (_, right) = store.split_node(pos.left.as_ref().unwrap().id, pos.offset)?;
-            pos.right = right.as_item();
-        }
-
         while remaining > 0 {
-            if let Some(item) = pos.right.take() {
+            if let Some(item) = &pos.right.as_ref().and_then(|i| i.upgrade()) {
                 if !item.deleted() {
                     let content_len = item.len() as i64;
                     if remaining < content_len {
                         store.split_node(item.id, remaining as u64)?;
+                        remaining = 0;
+                    } else {
+                        remaining -= content_len;
                     }
-                    remaining -= content_len;
-                    store.delete_item(&item, Some(&mut lock));
+                    store.delete_item(item, Some(&mut lock));
                 }
 
-                pos.right = item.right.as_ref().and_then(|right| right.as_item());
-                pos.left = Some(item);
+                pos.forward();
             } else {
                 break;
             }

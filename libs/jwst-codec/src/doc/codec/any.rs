@@ -146,6 +146,123 @@ impl Any {
     }
 }
 
+macro_rules! impl_primitive_from {
+    (unsigned, $($ty: ty),*) => {
+        $(
+            impl From<$ty> for Any {
+                fn from(value: $ty) -> Self {
+                    Self::Integer(value.into())
+                }
+            }
+        )*
+    };
+    (signed, $($ty: ty),*) => {
+        $(
+            impl From<$ty> for Any {
+                fn from(value: $ty) -> Self {
+                    Self::BigInt64(value.into())
+                }
+            }
+        )*
+    };
+    (string, $($ty: ty),*) => {
+        $(
+            impl From<$ty> for Any {
+                fn from(value: $ty) -> Self {
+                    Self::String(value.into())
+                }
+            }
+        )*
+    };
+}
+
+impl_primitive_from!(unsigned, u8, u16, u32, u64);
+impl_primitive_from!(signed, i8, i16, i32, i64);
+impl_primitive_from!(string, String, &str);
+
+impl From<usize> for Any {
+    fn from(value: usize) -> Self {
+        Self::Integer(value as u64)
+    }
+}
+
+impl From<isize> for Any {
+    fn from(value: isize) -> Self {
+        Self::BigInt64(value as i64)
+    }
+}
+
+impl From<f32> for Any {
+    fn from(value: f32) -> Self {
+        Self::Float32(value.into())
+    }
+}
+
+impl From<f64> for Any {
+    fn from(value: f64) -> Self {
+        Self::Float64(value.into())
+    }
+}
+
+impl From<bool> for Any {
+    fn from(value: bool) -> Self {
+        if value {
+            Self::True
+        } else {
+            Self::False
+        }
+    }
+}
+
+impl FromIterator<Any> for Any {
+    fn from_iter<I: IntoIterator<Item = Any>>(iter: I) -> Self {
+        Self::Array(iter.into_iter().collect())
+    }
+}
+
+impl<'a> FromIterator<&'a Any> for Any {
+    fn from_iter<I: IntoIterator<Item = &'a Any>>(iter: I) -> Self {
+        Self::Array(iter.into_iter().cloned().collect())
+    }
+}
+
+impl FromIterator<(String, Any)> for Any {
+    fn from_iter<I: IntoIterator<Item = (String, Any)>>(iter: I) -> Self {
+        let mut map = HashMap::new();
+        map.extend(iter);
+        Self::Object(map)
+    }
+}
+
+impl From<HashMap<String, Any>> for Any {
+    fn from(value: HashMap<String, Any>) -> Self {
+        Self::Object(value)
+    }
+}
+
+impl From<Vec<u8>> for Any {
+    fn from(value: Vec<u8>) -> Self {
+        Self::Binary(value)
+    }
+}
+
+impl From<&[u8]> for Any {
+    fn from(value: &[u8]) -> Self {
+        Self::Binary(value.into())
+    }
+}
+
+// TODO: impl for Any::Undefined
+impl<T: Into<Any>> From<Option<T>> for Any {
+    fn from(value: Option<T>) -> Self {
+        if let Some(val) = value {
+            val.into()
+        } else {
+            Any::Null
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -222,6 +339,7 @@ mod tests {
 
     proptest! {
         #[test]
+        #[cfg_attr(miri, ignore)]
         fn test_random_any(any in vec(any::<Any>(), 0..100)) {
             for any in &any {
                 let mut encoder = RawEncoder::default();
@@ -234,5 +352,66 @@ mod tests {
                 assert_eq!(any, &decoded);
             }
         }
+    }
+
+    #[test]
+    fn test_convert_to_any() {
+        let any: Vec<Any> = vec![
+            42u8.into(),
+            42u16.into(),
+            42u32.into(),
+            42u64.into(),
+            114.514f32.into(),
+            1919.810f64.into(),
+            (-42i8).into(),
+            (-42i16).into(),
+            (-42i32).into(),
+            (-42i64).into(),
+            false.into(),
+            true.into(),
+            "JWST".to_string().into(),
+            "OctoBase".into(),
+            vec![1u8, 9, 1, 9].into(),
+            (&[8u8, 1, 0][..]).into(),
+            [Any::True, 42u8.into()].iter().collect(),
+        ];
+        assert_eq!(
+            any,
+            vec![
+                Any::Integer(42),
+                Any::Integer(42),
+                Any::Integer(42),
+                Any::Integer(42),
+                Any::Float32(114.514.into()),
+                Any::Float64(1919.810.into()),
+                Any::BigInt64(-42),
+                Any::BigInt64(-42),
+                Any::BigInt64(-42),
+                Any::BigInt64(-42),
+                Any::False,
+                Any::True,
+                Any::String("JWST".to_string()),
+                Any::String("OctoBase".to_string()),
+                Any::Binary(vec![1, 9, 1, 9]),
+                Any::Binary(vec![8, 1, 0]),
+                Any::Array(vec![Any::True, Any::Integer(42)])
+            ]
+        );
+
+        assert_eq!(
+            vec![("key".to_string(), 10u64.into())]
+                .into_iter()
+                .collect::<Any>(),
+            Any::Object(HashMap::from_iter(vec![(
+                "key".to_string(),
+                Any::Integer(10)
+            )]))
+        );
+
+        let any: Any = 10u64.into();
+        assert_eq!(
+            [any].iter().collect::<Any>(),
+            Any::Array(vec![Any::Integer(10)])
+        );
     }
 }

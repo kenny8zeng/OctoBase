@@ -1,7 +1,8 @@
 use super::{utils::get_hash, *};
 use crate::types::JwstStorageResult;
-use jwst_storage_migration::{Migrator, MigratorTrait};
+use jwst::{Base64Engine, URL_SAFE_ENGINE};
 
+use sha2::{Digest, Sha256};
 pub(super) type BlobModel = <Blobs as EntityTrait>::Model;
 type BlobActiveModel = super::entities::blobs::ActiveModel;
 type BlobColumn = <Blobs as EntityTrait>::Column;
@@ -12,12 +13,17 @@ pub struct BlobDBStorage {
     pub(super) pool: DatabaseConnection,
 }
 
+impl AsRef<DatabaseConnection> for BlobDBStorage {
+    fn as_ref(&self) -> &DatabaseConnection {
+        &self.pool
+    }
+}
+
 impl BlobDBStorage {
     pub async fn init_with_pool(
         pool: DatabaseConnection,
         bucket: Arc<Bucket>,
     ) -> JwstStorageResult<Self> {
-        Migrator::up(&pool, None).await?;
         Ok(Self { bucket, pool })
     }
 
@@ -29,23 +35,32 @@ impl BlobDBStorage {
     }
 
     #[allow(unused)]
-    async fn all(&self, table: &str) -> Result<Vec<BlobModel>, DbErr> {
+    async fn all(&self, workspace: &str) -> Result<Vec<BlobModel>, DbErr> {
         Blobs::find()
-            .filter(BlobColumn::Workspace.eq(table))
+            .filter(BlobColumn::WorkspaceId.eq(workspace))
             .all(&self.pool)
             .await
     }
 
-    #[allow(unused)]
-    async fn count(&self, table: &str) -> Result<u64, DbErr> {
+    async fn keys(&self, workspace: &str) -> Result<Vec<String>, DbErr> {
         Blobs::find()
-            .filter(BlobColumn::Workspace.eq(table))
+            .filter(BlobColumn::WorkspaceId.eq(workspace))
+            .column(BlobColumn::Hash)
+            .all(&self.pool)
+            .await
+            .map(|r| r.into_iter().map(|f| f.hash).collect())
+    }
+
+    #[allow(unused)]
+    async fn count(&self, workspace: &str) -> Result<u64, DbErr> {
+        Blobs::find()
+            .filter(BlobColumn::WorkspaceId.eq(workspace))
             .count(&self.pool)
             .await
     }
 
-    async fn exists(&self, table: &str, hash: &str) -> Result<bool, DbErr> {
-        Blobs::find_by_id((table.into(), hash.into()))
+    async fn exists(&self, workspace: &str, hash: &str) -> Result<bool, DbErr> {
+        Blobs::find_by_id((workspace.into(), hash.into()))
             .count(&self.pool)
             .await
             .map(|c| c > 0)
@@ -53,13 +68,13 @@ impl BlobDBStorage {
 
     pub(super) async fn metadata(
         &self,
-        table: &str,
+        workspace: &str,
         hash: &str,
     ) -> JwstBlobResult<InternalBlobMetadata> {
-        Blobs::find_by_id((table.into(), hash.into()))
+        Blobs::find_by_id((workspace.into(), hash.into()))
             .select_only()
             .column_as(BlobColumn::Length, "size")
-            .column_as(BlobColumn::Timestamp, "created_at")
+            .column_as(BlobColumn::CreatedAt, "created_at")
             .into_model::<InternalBlobMetadata>()
             .one(&self.pool)
             .await
@@ -69,23 +84,23 @@ impl BlobDBStorage {
 
     pub(super) async fn get_blobs_size(&self, workspace: &str) -> Result<Option<i64>, DbErr> {
         Blobs::find()
-            .filter(BlobColumn::Workspace.eq(workspace))
+            .filter(BlobColumn::WorkspaceId.eq(workspace))
             .column_as(BlobColumn::Length, "size")
-            .column_as(BlobColumn::Timestamp, "created_at")
+            .column_as(BlobColumn::CreatedAt, "created_at")
             .into_model::<InternalBlobMetadata>()
             .all(&self.pool)
             .await
             .map(|r| r.into_iter().map(|f| f.size).reduce(|a, b| a + b))
     }
 
-    async fn insert(&self, table: &str, hash: &str, blob: &[u8]) -> Result<(), DbErr> {
-        if !self.exists(table, hash).await? {
+    async fn insert(&self, workspace: &str, hash: &str, blob: &[u8]) -> Result<(), DbErr> {
+        if !self.exists(workspace, hash).await? {
             Blobs::insert(BlobActiveModel {
-                workspace: Set(table.into()),
+                workspace_id: Set(workspace.into()),
                 hash: Set(hash.into()),
                 blob: Set(blob.into()),
                 length: Set(blob.len().try_into().unwrap()),
-                timestamp: Set(Utc::now().into()),
+                created_at: Set(Utc::now().into()),
             })
             .exec(&self.pool)
             .await?;
@@ -94,24 +109,24 @@ impl BlobDBStorage {
         Ok(())
     }
 
-    pub(super) async fn get(&self, table: &str, hash: &str) -> JwstBlobResult<BlobModel> {
-        Blobs::find_by_id((table.into(), hash.into()))
+    pub(super) async fn get(&self, workspace: &str, hash: &str) -> JwstBlobResult<BlobModel> {
+        Blobs::find_by_id((workspace.into(), hash.into()))
             .one(&self.pool)
             .await
             .map_err(|e| e.into())
             .and_then(|r| r.ok_or(JwstBlobError::BlobNotFound(hash.into())))
     }
 
-    async fn delete(&self, table: &str, hash: &str) -> Result<bool, DbErr> {
-        Blobs::delete_by_id((table.into(), hash.into()))
+    async fn delete(&self, workspace: &str, hash: &str) -> Result<bool, DbErr> {
+        Blobs::delete_by_id((workspace.into(), hash.into()))
             .exec(&self.pool)
             .await
             .map(|r| r.rows_affected == 1)
     }
 
-    async fn drop(&self, table: &str) -> Result<(), DbErr> {
+    async fn drop(&self, workspace: &str) -> Result<(), DbErr> {
         Blobs::delete_many()
-            .filter(BlobColumn::Workspace.eq(table))
+            .filter(BlobColumn::WorkspaceId.eq(workspace))
             .exec(&self.pool)
             .await?;
 
@@ -121,6 +136,16 @@ impl BlobDBStorage {
 
 #[async_trait]
 impl BlobStorage<JwstStorageError> for BlobDBStorage {
+    async fn list_blobs(&self, workspace: Option<String>) -> JwstStorageResult<Vec<String>> {
+        let _lock = self.bucket.read().await;
+        let workspace = workspace.unwrap_or("__default__".into());
+        if let Ok(keys) = self.keys(&workspace).await {
+            return Ok(keys);
+        }
+
+        Err(JwstStorageError::WorkspaceNotFound(workspace))
+    }
+
     async fn check_blob(&self, workspace: Option<String>, id: String) -> JwstStorageResult<bool> {
         let _lock = self.bucket.read().await;
         let workspace = workspace.unwrap_or("__default__".into());
@@ -161,7 +186,7 @@ impl BlobStorage<JwstStorageError> for BlobDBStorage {
         }
     }
 
-    async fn put_blob(
+    async fn put_blob_stream(
         &self,
         workspace: Option<String>,
         stream: impl Stream<Item = Bytes> + Send,
@@ -170,6 +195,25 @@ impl BlobStorage<JwstStorageError> for BlobDBStorage {
         let workspace = workspace.unwrap_or("__default__".into());
 
         let (hash, blob) = get_hash(stream).await;
+
+        if self.insert(&workspace, &hash, &blob).await.is_ok() {
+            Ok(hash)
+        } else {
+            Err(JwstStorageError::WorkspaceNotFound(workspace))
+        }
+    }
+
+    async fn put_blob(
+        &self,
+        workspace: Option<String>,
+        blob: Vec<u8>,
+    ) -> JwstStorageResult<String> {
+        let _lock = self.bucket.write().await;
+        let workspace = workspace.unwrap_or("__default__".into());
+        let mut hasher = Sha256::new();
+
+        hasher.update(&blob);
+        let hash = URL_SAFE_ENGINE.encode(hasher.finalize());
 
         if self.insert(&workspace, &hash, &blob).await.is_ok() {
             Ok(hash)
@@ -221,17 +265,19 @@ pub async fn blobs_storage_test(pool: &BlobDBStorage) -> anyhow::Result<()> {
     assert_eq!(
         all,
         vec![BlobModel {
-            workspace: "basic".into(),
+            workspace_id: "basic".into(),
             hash: "test".into(),
             blob: vec![1, 2, 3, 4],
             length: 4,
-            timestamp: all.get(0).unwrap().timestamp
+            created_at: all.get(0).unwrap().created_at
         }]
     );
     assert_eq!(pool.count("basic").await?, 1);
+    assert_eq!(pool.keys("basic").await?, vec!["test"]);
 
     pool.drop("basic").await?;
     assert_eq!(pool.count("basic").await?, 0);
+    assert_eq!(pool.keys("basic").await?, Vec::<String>::new());
 
     pool.insert("basic", "test1", &[1, 2, 3, 4]).await?;
 
@@ -239,14 +285,15 @@ pub async fn blobs_storage_test(pool: &BlobDBStorage) -> anyhow::Result<()> {
     assert_eq!(
         all,
         vec![BlobModel {
-            workspace: "basic".into(),
+            workspace_id: "basic".into(),
             hash: "test1".into(),
             blob: vec![1, 2, 3, 4],
             length: 4,
-            timestamp: all.get(0).unwrap().timestamp
+            created_at: all.get(0).unwrap().created_at
         }]
     );
     assert_eq!(pool.count("basic").await?, 1);
+    assert_eq!(pool.keys("basic").await?, vec!["test1"]);
 
     let metadata = pool.metadata("basic", "test1").await?;
 

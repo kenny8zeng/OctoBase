@@ -1,11 +1,11 @@
 use super::*;
-use crate::doc::StateVector;
-use std::collections::VecDeque;
-use std::sync::RwLockWriteGuard;
+use crate::{
+    doc::StateVector,
+    sync::{Arc, RwLock, RwLockWriteGuard, Weak},
+};
 use std::{
-    collections::{hash_map::Entry, HashMap, HashSet},
+    collections::{hash_map::Entry, HashMap, HashSet, VecDeque},
     ops::Range,
-    sync::{Arc, RwLock, Weak},
 };
 
 #[derive(Default, Debug)]
@@ -139,38 +139,66 @@ impl DocStore {
         None
     }
 
-    pub fn split_node<I: Into<Id>>(
-        &mut self,
-        id: I,
-        diff: u64,
-    ) -> JwstCodecResult<(StructInfo, StructInfo)> {
+    pub fn split_node<I: Into<Id>>(&mut self, id: I, diff: u64) -> JwstCodecResult {
         debug_assert!(diff > 0);
 
         let id = id.into();
 
         if let Some(items) = self.items.write().unwrap().get_mut(&id.client) {
             if let Some(idx) = Self::get_item_index(items, id.clock) {
-                let item = items.get(idx).unwrap().clone();
-                if item.is_item() {
-                    let (left_item, right_item) = item.split_at(diff)?;
-                    match (&item, &left_item) {
-                        (StructInfo::Item(old_item), StructInfo::Item(new_item)) => {
-                            // SAFETY:
-                            // we make sure store is the only entry of mutating an item,
-                            // and we already hold mutable reference of store, so it's safe to do so
-                            unsafe { Item::swap(old_item, new_item) };
-                        }
-                        _ => {
-                            items[idx] = left_item;
-                        }
-                    }
-                    items.insert(idx + 1, right_item.clone());
-                    return Ok((item, right_item));
-                }
+                Self::split_node_at(items, idx, diff)?;
+
+                return Ok(());
             }
         }
 
         Err(JwstCodecError::StructSequenceNotExists(id.client))
+    }
+
+    pub fn split_node_at(
+        items: &mut Vec<StructInfo>,
+        idx: usize,
+        diff: u64,
+    ) -> JwstCodecResult<(StructInfo, StructInfo)> {
+        debug_assert!(diff > 0);
+
+        let node = items.get(idx).unwrap().clone();
+        debug_assert!(node.is_item());
+        let (left_node, right_node) = node.split_at(diff)?;
+        match (&node, &left_node, &right_node) {
+            (
+                StructInfo::Item(raw_left_item),
+                StructInfo::Item(new_left_item),
+                StructInfo::Item(right_item),
+            ) => {
+                // SAFETY:
+                // we make sure store is the only entry of mutating an item,
+                // and we already hold mutable reference of store, so it's safe to do so
+                unsafe {
+                    let left_item = Item::inner_mut(raw_left_item);
+                    let right_item = Item::inner_mut(right_item);
+                    left_item.content = new_left_item.content.clone();
+
+                    // we had the correct left/right content
+                    // now build the references
+                    if let Some(right_right) = &left_item.right.as_ref().and_then(|i| i.as_item()) {
+                        Item::inner_mut(right_right).left = Some(right_node.as_weak());
+                        right_item.right = Some(StructInfo::WeakItem(Arc::downgrade(right_right)));
+                    }
+                    left_item.right = Some(right_node.as_weak());
+
+                    right_item.origin_left_id = Some(left_item.last_id());
+                    right_item.left = Some(node.as_weak());
+                    right_item.origin_right_id = left_item.origin_right_id;
+                };
+            }
+            _ => {
+                items[idx] = left_node;
+            }
+        }
+        items.insert(idx + 1, right_node.clone());
+
+        Ok((node, right_node))
     }
 
     pub fn split_at_and_get_right<I: Into<Id>>(&self, id: I) -> JwstCodecResult<StructInfo> {
@@ -180,21 +208,8 @@ impl DocStore {
                 let item = items.get(index).unwrap().clone();
                 let offset = id.clock - item.clock();
                 if offset > 0 && item.is_item() {
-                    let (left_item, right_item) = item.split_at(offset)?;
-                    match (&item, &left_item) {
-                        (StructInfo::Item(old_item), StructInfo::Item(new_item)) => {
-                            // SAFETY:
-                            // we make sure store is the only entry of mutating an item,
-                            // and we already hold mutable reference of store, so it's safe to do so
-                            unsafe { Item::swap(old_item, new_item) };
-                        }
-                        _ => {
-                            items[index] = left_item.clone();
-                        }
-                    }
-                    items.insert(index + 1, right_item.clone());
-
-                    return Ok(right_item);
+                    let (_, right) = Self::split_node_at(items, index, offset)?;
+                    return Ok(right);
                 } else {
                     return Ok(item);
                 }
@@ -211,21 +226,8 @@ impl DocStore {
                 let item = items.get(index).unwrap().clone();
                 let offset = id.clock - item.clock();
                 if offset != item.len() - 1 && !item.is_gc() {
-                    let (left_item, right_item) = item.split_at(offset + 1)?;
-                    items.insert(index + 1, right_item);
-                    match (&item, &left_item) {
-                        (StructInfo::Item(old_item), StructInfo::Item(new_item)) => {
-                            // SAFETY:
-                            // we make sure store is the only entry of mutating an item,
-                            // and we already hold mutable reference of store, so it's safe to do so
-                            unsafe { Item::swap(old_item, new_item) };
-                            return Ok(item);
-                        }
-                        _ => {
-                            items[index] = left_item.clone();
-                            return Ok(left_item);
-                        }
-                    }
+                    let (left, _) = Self::split_node_at(items, index, offset + 1)?;
+                    return Ok(left);
                 } else {
                     return Ok(item);
                 }
@@ -259,12 +261,11 @@ impl DocStore {
         match self.types.write().unwrap().entry(name.to_string()) {
             Entry::Occupied(e) => e.get().clone(),
             Entry::Vacant(e) => {
-                let ty = YType {
+                let ty = Arc::new(RwLock::new(YType {
                     kind: YTypeKind::Unknown,
                     root_name: Some(name.to_string()),
                     ..Default::default()
-                }
-                .into_ref();
+                }));
 
                 e.insert(ty.clone());
 
@@ -282,11 +283,11 @@ impl DocStore {
     ///     - [None] means borrow left.parent or right.parent
     pub(crate) fn repair(&self, item: &mut Item, store_ref: StoreRef) -> JwstCodecResult {
         if let Some(left_id) = item.origin_left_id {
-            item.left = Some(self.split_at_and_get_left(left_id)?);
+            item.left = Some(self.split_at_and_get_left(left_id)?.as_weak());
         }
 
         if let Some(right_id) = item.origin_right_id {
-            item.right = Some(self.split_at_and_get_right(right_id)?);
+            item.right = Some(self.split_at_and_get_right(right_id)?.as_weak());
         }
 
         match &item.parent {
@@ -296,7 +297,7 @@ impl DocStore {
             Some(Parent::String(str)) => {
                 let ty = self.get_or_create_type(str);
                 ty.write().unwrap().store = Arc::downgrade(&store_ref);
-                item.parent.replace(Parent::Type(ty));
+                item.parent.replace(Parent::Type(Arc::downgrade(&ty)));
             }
             // type as item
             // let text = doc.create_text("text")
@@ -307,6 +308,11 @@ impl DocStore {
                     Some(StructInfo::Item(_)) => match &item.content.as_ref() {
                         Content::Type(ty) => {
                             ty.write().unwrap().store = Arc::downgrade(&store_ref);
+                            item.parent.replace(Parent::Type(Arc::downgrade(ty)));
+                        }
+                        Content::WeakType(ty) => {
+                            ty.upgrade().unwrap().write().unwrap().store =
+                                Arc::downgrade(&store_ref);
                             item.parent.replace(Parent::Type(ty.clone()));
                         }
                         Content::Deleted(_) => {
@@ -325,10 +331,10 @@ impl DocStore {
             }
             // no item.parent, borrow left.parent or right.parent
             None => {
-                if let Some(StructInfo::Item(left)) = &item.left {
+                if let Some(left) = item.left.as_ref().and_then(|i| i.as_item()) {
                     item.parent = left.parent.clone();
                     item.parent_sub = left.parent_sub.clone();
-                } else if let Some(StructInfo::Item(right)) = &item.right {
+                } else if let Some(right) = item.right.as_ref().and_then(|i| i.as_item()) {
                     item.parent = right.parent.clone();
                     item.parent_sub = right.parent_sub.clone();
                 }
@@ -341,10 +347,16 @@ impl DocStore {
 
     pub(crate) fn integrate(
         &mut self,
-        mut struct_info: StructInfo,
+        struct_info: StructInfo,
         offset: u64,
         parent: Option<&mut YType>,
     ) -> JwstCodecResult {
+        let mut struct_info = if let StructInfo::WeakItem(item) = struct_info {
+            StructInfo::Item(item.upgrade().unwrap())
+        } else {
+            struct_info
+        };
+
         match &mut struct_info {
             StructInfo::Item(item) => {
                 // SAFETY:
@@ -358,11 +370,12 @@ impl DocStore {
                     let left =
                         self.split_at_and_get_left(Id::new(this.id.client, this.id.clock - 1))?;
                     this.origin_left_id = Some(left.last_id());
-                    this.left = Some(left);
+                    this.left = Some(left.as_weak());
                     this.content = Arc::new(this.content.split(offset)?.1);
                 }
 
                 if let Some(Parent::Type(ty)) = &this.parent {
+                    let ty = ty.upgrade().unwrap();
                     let mut parent_lock: Option<RwLockWriteGuard<YType>> = None;
                     let parent = if let Some(p) = parent {
                         p
@@ -375,10 +388,16 @@ impl DocStore {
                     let right_is_null_or_has_left = match &this.right {
                         None => true,
                         Some(StructInfo::Item(right)) => right.left.is_some(),
+                        Some(StructInfo::WeakItem(right)) => {
+                            right.upgrade().unwrap().left.is_some()
+                        }
                         _ => false,
                     };
                     let left_has_other_right_than_self = match &this.left {
                         Some(StructInfo::Item(left)) => left.right != this.right,
+                        Some(StructInfo::WeakItem(left)) => {
+                            left.upgrade().unwrap().right != this.right
+                        }
                         _ => false,
                     };
 
@@ -415,7 +434,7 @@ impl DocStore {
                                 if this.origin_left_id == conflict_item.origin_left_id {
                                     // case 1
                                     if conflict_id.client < this.id.client {
-                                        this.left = Some(conflict.clone());
+                                        this.left = Some(conflict.as_weak());
                                         conflicting_items.clear();
                                     } else if this.origin_right_id == conflict_item.origin_right_id
                                     {
@@ -430,7 +449,7 @@ impl DocStore {
                                     if items_before_origin.contains(&conflict_item_left)
                                         && !conflicting_items.contains(&conflict_item_left)
                                     {
-                                        this.left = Some(conflict.clone());
+                                        this.left = Some(conflict.as_weak());
                                         conflicting_items.clear();
                                     }
                                 } else {
@@ -446,13 +465,13 @@ impl DocStore {
 
                     // reconnect left/right
                     // has left, connect left <-> self <-> left.right
-                    if let Some(StructInfo::Item(left)) = &this.left {
+                    if let Some(left) = this.left.as_ref().and_then(|i| i.as_item()) {
                         // Safety:
                         // we are in the process of integrating a new item.
                         // we got the write lock of store, parent.
                         // it's safe to modify the internal item.
-                        let left = unsafe { Item::inner_mut(left) };
-                        this.right = left.right.replace(struct_info.clone());
+                        let left = unsafe { Item::inner_mut(&left) };
+                        this.right = left.right.replace(struct_info.as_weak());
                     } else {
                         // no left, parent.start = this
                         this.right = if let Some(parent_sub) = &this.parent_sub {
@@ -462,18 +481,20 @@ impl DocStore {
                                 .and_then(|map| map.get(parent_sub))
                                 .map(|n| n.head())
                         } else {
-                            parent.start.replace(struct_info.clone())
-                        };
+                            parent.start.replace(struct_info.as_weak())
+                        }
+                        .as_ref()
+                        .map(|i| i.as_weak());
                     }
 
                     // has right, connect
-                    if let Some(StructInfo::Item(right)) = &this.right {
+                    if let Some(right) = &this.right.as_ref().and_then(|i| i.as_item()) {
                         // Safety:
                         // we are in the process of integrating a new item.
                         // we got the write lock of store, parent.
                         // it's safe to modify the internal item.
                         let right = unsafe { Item::inner_mut(right) };
-                        right.left = Some(struct_info.clone());
+                        right.left = Some(struct_info.as_weak());
                     } else {
                         // no right, parent.start = this, delete this.left
                         if let Some(parent_sub) = &this.parent_sub {
@@ -504,6 +525,7 @@ impl DocStore {
                     parent_lock.take();
                 }
             }
+            StructInfo::WeakItem(_) => unreachable!(),
             StructInfo::GC { id, len } => {
                 if offset > 0 {
                     id.clock += offset;
@@ -531,7 +553,7 @@ impl DocStore {
             if let Some(parent) = parent {
                 parent.len -= item.len();
             } else if let Some(Parent::Type(ty)) = &item.parent {
-                ty.write().unwrap().len -= item.len();
+                ty.upgrade().unwrap().write().unwrap().len -= item.len();
             }
         }
 
@@ -547,7 +569,7 @@ impl DocStore {
     }
 
     pub(crate) fn delete(&self, struct_info: &StructInfo, parent: Option<&mut YType>) {
-        if let StructInfo::Item(item) = struct_info {
+        if let Some(item) = struct_info.as_item() {
             self.delete_item(item.as_ref(), parent);
         }
     }
@@ -566,29 +588,13 @@ impl DocStore {
                     let id = struct_info.id();
 
                     if !struct_info.deleted() && id.clock < range.start {
-                        match struct_info.split_at(start - id.clock) {
-                            Ok((left, right)) => {
-                                match (&struct_info, &left) {
-                                    (StructInfo::Item(old_item), StructInfo::Item(new_item)) => {
-                                        // SAFETY:
-                                        // we make sure store is the only entry of mutating an item,
-                                        // and we already hold mutable reference of store, so it's safe to do so
-                                        unsafe { Item::swap(old_item, new_item) };
-                                    }
-                                    _ => {
-                                        items[idx] = left;
-                                    }
-                                }
-                                items.insert(idx + 1, right);
-                                idx += 1;
-                            }
-                            Err(e) => return Err(e),
-                        }
+                        DocStore::split_node_at(items, idx, start - id.clock)?;
+                        idx += 1;
                     }
                 };
 
                 while idx < items.len() {
-                    let mut struct_info = &items[idx];
+                    let struct_info = items[idx].clone();
                     let id = struct_info.id();
 
                     if !struct_info.deleted() && id.clock < end {
@@ -596,29 +602,9 @@ impl DocStore {
                         // -----item-----
                         //           ^end
                         if end < id.clock + struct_info.len() {
-                            match struct_info.split_at(end - id.clock) {
-                                Ok((left, right)) => {
-                                    match (&struct_info, &left) {
-                                        (
-                                            StructInfo::Item(old_item),
-                                            StructInfo::Item(new_item),
-                                        ) => {
-                                            // SAFETY:
-                                            // we make sure store is the only entry of mutating an item,
-                                            // and we already hold mutable reference of store, so it's safe to do so
-                                            unsafe { Item::swap(old_item, new_item) };
-                                        }
-                                        _ => {
-                                            items[idx] = left;
-                                        }
-                                    }
-                                    items.insert(idx + 1, right);
-                                    struct_info = &items[idx];
-                                }
-                                Err(e) => return Err(e),
-                            }
+                            DocStore::split_node_at(items, idx, end - id.clock)?;
                         }
-                        self.delete(struct_info, None);
+                        self.delete(&struct_info, None);
                     } else {
                         break;
                     }
@@ -708,13 +694,13 @@ mod tests {
 
     #[test]
     fn test_get_state() {
-        {
+        loom_model!({
             let doc_store = DocStore::new();
             let state = doc_store.get_state(1);
             assert_eq!(state, 0);
-        }
+        });
 
-        {
+        loom_model!({
             let doc_store = DocStore::new();
 
             let client_id = 1;
@@ -739,18 +725,18 @@ mod tests {
             assert_eq!(state, struct_info2.clock() + struct_info2.len());
 
             assert!(doc_store.self_check().is_ok());
-        }
+        });
     }
 
     #[test]
     fn test_get_state_vector() {
-        {
+        loom_model!({
             let doc_store = DocStore::new();
             let state_map = doc_store.get_state_vector();
             assert!(state_map.is_empty());
-        }
+        });
 
-        {
+        loom_model!({
             let doc_store = DocStore::new();
 
             let client1 = 1;
@@ -792,49 +778,51 @@ mod tests {
             );
 
             assert!(doc_store.self_check().is_ok());
-        }
+        });
     }
 
     #[test]
     fn test_add_item() {
-        let doc_store = DocStore::new();
+        loom_model!({
+            let doc_store = DocStore::new();
 
-        let struct_info1 = StructInfo::GC {
-            id: Id::new(1, 0),
-            len: 5,
-        };
-        let struct_info2 = StructInfo::Skip {
-            id: Id::new(1, 5),
-            len: 1,
-        };
-        let struct_info3_err = StructInfo::Skip {
-            id: Id::new(1, 5),
-            len: 1,
-        };
-        let struct_info3 = StructInfo::Skip {
-            id: Id::new(1, 6),
-            len: 1,
-        };
+            let struct_info1 = StructInfo::GC {
+                id: Id::new(1, 0),
+                len: 5,
+            };
+            let struct_info2 = StructInfo::Skip {
+                id: Id::new(1, 5),
+                len: 1,
+            };
+            let struct_info3_err = StructInfo::Skip {
+                id: Id::new(1, 5),
+                len: 1,
+            };
+            let struct_info3 = StructInfo::Skip {
+                id: Id::new(1, 6),
+                len: 1,
+            };
 
-        assert!(doc_store.add_item(struct_info1.clone()).is_ok());
-        assert!(doc_store.add_item(struct_info2).is_ok());
-        assert_eq!(
-            doc_store.add_item(struct_info3_err),
-            Err(JwstCodecError::StructClockInvalid {
-                expect: 6,
-                actually: 5
-            })
-        );
-        assert!(doc_store.add_item(struct_info3.clone()).is_ok());
-        assert_eq!(
-            doc_store.get_state(struct_info1.client()),
-            struct_info3.clock() + struct_info3.len()
-        );
+            assert!(doc_store.add_item(struct_info1.clone()).is_ok());
+            assert!(doc_store.add_item(struct_info2).is_ok());
+            assert_eq!(
+                doc_store.add_item(struct_info3_err),
+                Err(JwstCodecError::StructClockInvalid {
+                    expect: 6,
+                    actually: 5
+                })
+            );
+            assert!(doc_store.add_item(struct_info3.clone()).is_ok());
+            assert_eq!(
+                doc_store.get_state(struct_info1.client()),
+                struct_info3.clock() + struct_info3.len()
+            );
+        });
     }
 
     #[test]
     fn test_get_item() {
-        {
+        loom_model!({
             let doc_store = DocStore::new();
             let struct_info = StructInfo::GC {
                 id: Id::new(1, 0),
@@ -843,9 +831,9 @@ mod tests {
             doc_store.add_item(struct_info.clone()).unwrap();
 
             assert_eq!(doc_store.get_node(Id::new(1, 9)), Some(struct_info));
-        }
+        });
 
-        {
+        loom_model!({
             let doc_store = DocStore::new();
             let struct_info1 = StructInfo::GC {
                 id: Id::new(1, 0),
@@ -859,15 +847,15 @@ mod tests {
             doc_store.add_item(struct_info2.clone()).unwrap();
 
             assert_eq!(doc_store.get_node(Id::new(1, 25)), Some(struct_info2));
-        }
+        });
 
-        {
+        loom_model!({
             let doc_store = DocStore::new();
 
             assert_eq!(doc_store.get_node(Id::new(1, 0)), None);
-        }
+        });
 
-        {
+        loom_model!({
             let doc_store = DocStore::new();
             let struct_info1 = StructInfo::GC {
                 id: Id::new(1, 0),
@@ -881,40 +869,42 @@ mod tests {
             doc_store.add_item(struct_info2).unwrap();
 
             assert_eq!(doc_store.get_node(Id::new(1, 35)), None);
-        }
+        });
     }
 
     #[test]
     fn test_split_and_get() {
-        let doc_store = DocStore::new();
-        let struct_info1 = StructInfo::Item(Arc::new(
-            ItemBuilder::new()
-                .id((1, 0).into())
-                .content(Content::String(String::from("octo")))
-                .build(),
-        ));
+        loom_model!({
+            let doc_store = DocStore::new();
+            let struct_info1 = StructInfo::Item(Arc::new(
+                ItemBuilder::new()
+                    .id((1, 0).into())
+                    .content(Content::String(String::from("octo")))
+                    .build(),
+            ));
 
-        let struct_info2 = StructInfo::Item(Arc::new(
-            ItemBuilder::new()
-                .id((1, struct_info1.len()).into())
-                .left_id(Some(struct_info1.id()))
-                .content(Content::String(String::from("base")))
-                .build(),
-        ));
-        doc_store.add_item(struct_info1.clone()).unwrap();
-        doc_store.add_item(struct_info2).unwrap();
+            let struct_info2 = StructInfo::Item(Arc::new(
+                ItemBuilder::new()
+                    .id((1, struct_info1.len()).into())
+                    .left_id(Some(struct_info1.id()))
+                    .content(Content::String(String::from("base")))
+                    .build(),
+            ));
+            doc_store.add_item(struct_info1.clone()).unwrap();
+            doc_store.add_item(struct_info2).unwrap();
 
-        let s1 = doc_store.get_node(Id::new(1, 0)).unwrap();
-        assert_eq!(s1, struct_info1);
-        let left = doc_store.split_at_and_get_left((1, 1)).unwrap();
-        assert_eq!(left.len(), 2); // octo => oc_to
+            let s1 = doc_store.get_node(Id::new(1, 0)).unwrap();
+            assert_eq!(s1, struct_info1);
+            let left = doc_store.split_at_and_get_left((1, 1)).unwrap();
+            assert_eq!(left.len(), 2); // octo => oc_to
 
-        // s1 used to be (1, 4), but it actually ref of first item in store, so now it should be (1, 2)
-        assert_eq!(
-            s1, left,
-            "doc internal mutation should not modify the pointer"
-        );
-        let right = doc_store.split_at_and_get_right((1, 5)).unwrap();
-        assert_eq!(right.len(), 3); // base => b_ase
+            // s1 used to be (1, 4), but it actually ref of first item in store, so now it should be (1, 2)
+            assert_eq!(
+                s1, left,
+                "doc internal mutation should not modify the pointer"
+            );
+            let right = doc_store.split_at_and_get_right((1, 5)).unwrap();
+            assert_eq!(right.len(), 3); // base => b_ase
+        });
     }
 }

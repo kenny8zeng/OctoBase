@@ -85,7 +85,7 @@ impl Context {
             return StatusCode::NOT_FOUND.into_response()
         };
 
-        if meta.size != file.len() as u64 {
+        if meta.size != file.len() as i64 {
             header.insert(
                 CONTENT_LENGTH,
                 HeaderValue::from_str(&file.len().to_string()).unwrap(),
@@ -108,7 +108,7 @@ impl Context {
         if let Ok(id) = self
             .get_storage()
             .blobs()
-            .put_blob(workspace.clone(), stream)
+            .put_blob_stream(workspace.clone(), stream)
             .await
         {
             if has_error {
